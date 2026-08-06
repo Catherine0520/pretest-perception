@@ -89,8 +89,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         p = urlparse(self.path).path
         if p in ('/', '/index.html'): self._html()
+        elif p == '/admin': self._admin()
         elif p.startswith('/img/'): self._image(p)
         elif p.startswith('/ref/'): self._ref(p)
+        elif p.startswith('/download/'): self._download(p)
         elif p == '/api/data': self._json({
             'anchors': ANCHOR_GRIDS, 'training': TRAINING_GRIDS, 'main': MAIN_GRIDS,
             'refs': REF_SCORES, 'attention_check': ATTN_GRID, 'attention_position': 10,
@@ -135,6 +137,26 @@ class Handler(BaseHTTPRequestHandler):
     def _ref(self, p):
         gid = p.split('/')[-1]
         self._json(REF_SCORES.get(gid, {'FLD': 4, 'GEO': 4, 'FIR': 4}))
+
+    def _admin(self):
+        # List all saved rating data + download links
+        files = sorted(DATA_DIR.glob('pretest_P*.csv'), reverse=True)
+        rows = ''
+        for f in files:
+            name = f.name
+            # Count lines minus header
+            try:
+                n = len(f.read_text().strip().split('\n')) - 1
+            except: n = '?'
+            rows += f'<tr><td>{name}</td><td>{n} ratings</td><td><a href="/download/{name}">Download</a></td></tr>'
+        if not rows:
+            rows = '<tr><td colspan="3">暂无数据。参与者提交评分后这里会出现文件。</td></tr>'
+
+        page = ADMIN_HTML.replace('{{ROWS}}', rows)
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(page.encode())
 
     def _save(self):
         length = int(self.headers.get('Content-Length', 0))
@@ -460,6 +482,31 @@ R();
 function bindE(){S.qStart=Date.now();if(['practice','main'].includes(S.phase))chk();}
 R();
 </script>
+</body>
+</html>'''
+
+ADMIN_HTML = r'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>数据管理 — 预测试</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;max-width:700px;margin:40px auto;padding:20px;background:#f5f5f5}
+h1{color:#2c3e50}
+table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+th{background:#2c3e50;color:#fff;padding:10px 14px;text-align:left}
+td{padding:10px 14px;border-bottom:1px solid #eee}
+a{color:#0984e3;text-decoration:none}
+a:hover{text-decoration:underline}
+.refresh{margin:12px 0;display:inline-block;padding:8px 18px;background:#0984e3;color:#fff;border-radius:6px;text-decoration:none;font-size:.9em}
+</style>
+</head>
+<body>
+<h1>预测试数据管理</h1>
+<p style="color:#888">参与者提交评分后，数据文件会出现在下方。点击 Download 下载 CSV。</p>
+<a class="refresh" href="/admin">刷新</a>
+<table><tr><th>文件名</th><th>数据量</th><th>操作</th></tr>{{ROWS}}</table>
+<p style="color:#888;margin-top:20px;font-size:.8em">注意：Render 免费版重新部署后数据会丢失。请及时下载保存。</p>
 </body>
 </html>'''
 
