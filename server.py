@@ -139,6 +139,23 @@ class Handler(BaseHTTPRequestHandler):
         gid = p.split('/')[-1]
         self._json(REF_SCORES.get(gid, {'FLD': 4, 'GEO': 4, 'FIR': 4}))
 
+    def _download(self, p):
+        fname = p.split('/')[-1]
+        # 只允许下载 data 目录中的 CSV 和 JSON 文件
+        if not fname or '..' in fname:
+            self.send_error(400); return
+        fpath = DATA_DIR / fname
+        if not fpath.exists():
+            self.send_error(404); return
+        data = fpath.read_bytes()
+        ct = 'text/csv; charset=utf-8' if fname.endswith('.csv') else 'application/json; charset=utf-8'
+        self.send_response(200)
+        self.send_header('Content-Type', ct)
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Content-Disposition', f'attachment; filename="{fname}"')
+        self.end_headers()
+        self.wfile.write(data)
+
     def _admin(self):
         # List all saved rating data + download links + diagnostics
         all_csvs = sorted(DATA_DIR.glob('*.csv'), reverse=True)
