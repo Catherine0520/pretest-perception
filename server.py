@@ -63,6 +63,12 @@ random.shuffle(remaining)
 TRAINING_GRIDS = remaining[:6]
 MAIN_GRIDS = remaining[6:]
 ATTN_GRID = TRAINING_GRIDS[1] if len(TRAINING_GRIDS) > 1 else None
+# 第2注意力检验：从正式阶段随机选一张在后期重复
+ATTN_GRID_2 = MAIN_GRIDS[3] if len(MAIN_GRIDS) > 3 else None
+ATTN_POS_2 = 13  # 在第13位重复（正式阶段过半后）
+# 指令检验：随机选一个灾种和一组图，嵌入"本题请选4"
+INSTR_CHECK_GRID = MAIN_GRIDS[6] if len(MAIN_GRIDS) > 6 else None
+INSTR_CHECK_HAZARD = 'GEO'  # 在 GEO 问题上嵌入指令（GEO 最容易被忽略）
 
 # --- AI reference scores ---
 SAMPLE_BY_ID = {r['grid_id']: r for r in SAMPLE}
@@ -96,6 +102,8 @@ class Handler(BaseHTTPRequestHandler):
         elif p == '/api/data': self._json({
             'anchors': ANCHOR_GRIDS, 'training': TRAINING_GRIDS, 'main': MAIN_GRIDS,
             'refs': REF_SCORES, 'attention_check': ATTN_GRID, 'attention_position': 10,
+            'attention_check_2': ATTN_GRID_2, 'attention_position_2': ATTN_POS_2,
+            'instr_check_grid': INSTR_CHECK_GRID, 'instr_check_hazard': INSTR_CHECK_HAZARD,
         })
         else: self.send_error(404)
 
@@ -213,9 +221,12 @@ class Handler(BaseHTTPRequestHandler):
             w = csv.writer(f)
             if is_new:
                 w.writerow(['participant_id', 'phase', 'grid_id', 'is_attention_check',
+                            'is_ac2', 'is_instr', 'instr_hazard', 'instr_passed',
                             'FLD', 'GEO', 'FIR', 'response_time_sec'])
             w.writerow([pid, body.get('phase', ''), body.get('grid_id', ''),
-                        body.get('is_ac', ''),
+                        body.get('is_ac', ''), body.get('is_ac2', ''),
+                        body.get('is_instr', ''), body.get('instr_hazard', ''),
+                        body.get('instr_passed', ''),
                         body.get('FLD', ''), body.get('GEO', ''), body.get('FIR', ''),
                         round(float(body.get('response_time_sec', 0)), 1)])
         # Also save demographics on first call for this participant
@@ -309,11 +320,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei
 let D={};
 let S={phase:'briefing',pid:'P01',age:'',cq:'',page:0,
        anchors:[],train:[],main:[],refs:{},attnGrid:null,attnPos:10,
+       attnGrid2:null,attnPos2:13,instrGrid:null,instrHazard:'GEO',
        currentIdx:0,currentList:[],ratings:[],qStart:0,trainResults:[]};
 
 fetch('/api/data').then(r=>r.json()).then(d=>{
     Object.assign(S,{anchors:d.anchors,train:d.training,main:shuffle(d.main),
-                     refs:d.refs,attnGrid:d.attention_check,attnPos:d.attention_position});
+                     refs:d.refs,attnGrid:d.attention_check,attnPos:d.attention_position,
+                     attnGrid2:d.attention_check_2,attnPos2:d.attention_position_2,
+                     instrGrid:d.instr_check_grid,instrHazard:d.instr_check_hazard});
 });
 
 function shuffle(a){for(let i=a.length-1;i>0;i--){let j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}return a}
@@ -417,7 +431,10 @@ ${fastWarn()}
 
 function Bm(){
 let g=S.currentList[S.currentIdx],pct=Math.round((S.currentIdx+1)/S.currentList.length*100);
-let acWarn=(S.currentIdx===S.attnPos-1&&S.attnGrid)?'<div class="attn-warn show">注意：接下来的场景您之前已经见过。请根据当前判断评分。</div>':'';
+let acWarn='';
+if(S.currentIdx===S.attnPos-1&&S.attnGrid)acWarn+='<div class="attn-warn show">注意：接下来的场景您之前已经见过。请根据当前判断评分。</div>';
+if(S.currentIdx===S.attnPos2-1&&S.attnGrid2)acWarn+='<div class="attn-warn show">注意：接下来的场景您在本轮中已经评过。请根据当前判断评分，不要刻意保持一致。</div>';
+if(S.instrPos!==undefined&&S.currentIdx===S.instrPos)acWarn+='<div class="attn-warn show" style="background:#dfe6e9">📋 本轮为指令检验，请仔细阅读问题文字。</div>';
 return `<div class="top"><h1>第3步：正式评分</h1><div class="sub">独立判断 · 无反馈</div></div>
 <div class="steps"><span>锚定</span><span>练习</span><span class="on">正式评分</span></div>
 <div class="bar-wrap"><div class="bar-fill" style="width:${pct}%"></div></div>
@@ -425,7 +442,7 @@ return `<div class="top"><h1>第3步：正式评分</h1><div class="sub">独立�
 ${acWarn}
 ${imgGrid(g)}
 ${cueToggle()}
-${ratingForm('main')}
+${ratingForm('main',(S.instrPos!==undefined&&S.currentIdx===S.instrPos)?S.instrHazard:null)}
 ${scaleTracker()}
 ${fastWarn()}
 <div class="btns"><button class="btn btn-p" id="sub" disabled onclick="subMain()">${S.currentIdx<S.currentList.length-1?'提交→下一组':'提交→反馈问卷'}</button></div>`;
@@ -475,18 +492,23 @@ return `<div class="cue-toggle"><button onclick="document.getElementById('cuecar
 <p style="font-size:.72em;color:#888;margin-top:4px">1=最低 · 4=中等 · 7=最高 &nbsp;|&nbsp; 三个灾种独立判断</p></div>`;
 }
 
-function ratingForm(phase){
+function ratingForm(phase,instrHazard){
 let scales={
   FLD:{q:'Q1. 如果发生暴雨，从街景来看，这个地方<b>积水</b>的可能性有多大？',
        tip:'1=几乎不可能积水 · 4=中等 · 7=几乎必定积水',
        lbls:['几乎不可能\\n积水','可能性\\n很低','可能性\\n较低','中等','可能性\\n较高','可能性\\n很高','几乎必定\\n积水']},
   GEO:{q:'Q2. 从街景来看，这个地方发生<b>滑坡/崩塌</b>的可能性有多大？',
-       tip:'1=完全无风险 · 4=中等 · 7=极端风险',
+       tip:'1=完全无风险 · 4=中等 · 7=极端风险 · 看不到坡面→直接1分',
        lbls:['完全\\n无风险','风险\\n极低','风险\\n较低','中等','风险\\n较高','风险\\n很高','极端\\n风险']},
   FIR:{q:'Q3. 如果附近建筑发生火灾，从街景来看，<b>疏散和消防车</b>到达有多困难？',
        tip:'1=极容易疏散 · 4=中等 · 7=几乎无法疏散',
        lbls:['极容易\\n疏散','很容易\\n疏散','较容易\\n疏散','中等','较困难\\n疏散','很困难\\n疏散','几乎无法\\n疏散']}
 };
+// 指令检验：嵌入"本题请选4"
+if(instrHazard && scales[instrHazard]){
+  scales[instrHazard].q='<span style="color:#e17055">【指令检验】本题请选4。</span> '+scales[instrHazard].q;
+  scales[instrHazard].tip='请仔细阅读问题文字后作答 · '+scales[instrHazard].tip;
+}
 let h='';
 for(let k of ['FLD','GEO','FIR']){
   let s=scales[k];
@@ -558,23 +580,50 @@ S.trainResults[S.currentIdx]={...r,rFLD:ref.FLD,rGEO:ref.GEO,rFIR:ref.FIR};
 S.ratings.push({phase:'practice',grid_id:g,...r,response_time_sec:rt,is_ac:''});
 saveOne('practice',g,r,false);
 S.currentIdx++;
-if(S.currentIdx>=S.currentList.length){let m=[...S.main];if(S.attnGrid&&S.attnPos<m.length)m.splice(S.attnPos,0,S.attnGrid);S.currentList=m;S.currentIdx=0;S.phase='main';}
+if(S.currentIdx>=S.currentList.length){let m=[...S.main];
+  if(S.attnGrid&&S.attnPos<=m.length)m.splice(S.attnPos,0,S.attnGrid);
+  if(S.attnGrid2&&S.attnPos2<=m.length)m.splice(S.attnPos2,0,S.attnGrid2);
+  if(S.instrGrid){let ip=Math.min(8,m.length);m.splice(ip,0,S.instrGrid);S.instrPos=ip;}
+  S.currentList=m;S.currentIdx=0;S.phase='main';}
 R();S.qStart=Date.now();
 }
 function subMain(){
 let r=getR();if(!r.FLD||!r.GEO||!r.FIR)return;
-let g=S.currentList[S.currentIdx],rt=(Date.now()-S.qStart)/1000,isAC=(g===S.attnGrid&&S.currentIdx===S.attnPos);
-S.ratings.push({phase:'main',grid_id:g,...r,response_time_sec:rt,is_ac:isAC?'1':''});
+let g=S.currentList[S.currentIdx],rt=(Date.now()-S.qStart)/1000;
+let isAC1=(g===S.attnGrid&&S.currentIdx===S.attnPos);
+let isAC2=(g===S.attnGrid2&&S.currentIdx===S.attnPos2);
+let isInstr=(S.instrPos!==undefined&&S.currentIdx===S.instrPos);
+let isAC=isAC1||isAC2||isInstr;
+// 指令检验：记录是否遵从了"选4"指令
+let instrPassed=null;
+if(isInstr&&S.instrHazard){
+  instrPassed=r[S.instrHazard]===4;
+}
+S.ratings.push({phase:'main',grid_id:g,...r,response_time_sec:rt,
+  is_ac:isAC?'1':'',is_ac2:isAC2?'1':'',is_instr:isInstr?'1':'',
+  instr_hazard:isInstr?S.instrHazard:'',instr_passed:instrPassed});
 saveOne('main',g,r,isAC);
 S.currentIdx++;if(S.currentIdx>=S.currentList.length)S.phase='feedback';
 R();S.qStart=Date.now();
 }
 async function subFeedback(){
 let fb={};for(let i=1;i<=9;i++)fb['Q'+i]=document.getElementById('f'+i)?.value||'';
+// 注意力检验 C1: 练习 R117C010 vs 正式 R117C010
 let pracR=S.trainResults[1],mainR=S.ratings.filter(r=>r.grid_id===S.attnGrid&&r.phase==='main')[0];
-let acPassed=null;
-if(pracR&&mainR)acPassed=[Math.abs(pracR.FLD-mainR.FLD),Math.abs(pracR.GEO-mainR.GEO),Math.abs(pracR.FIR-mainR.FIR)].every(d=>d<=2);
-let payload={participant_id:S.pid,demographics:{age:S.age,chongqing_years:S.cq},feedback:fb,ac_passed:acPassed,n_ratings:S.ratings.length};
+let ac1Passed=null;
+if(pracR&&mainR)ac1Passed=[Math.abs(pracR.FLD-mainR.FLD),Math.abs(pracR.GEO-mainR.GEO),Math.abs(pracR.FIR-mainR.FIR)].every(d=>d<=2);
+// 注意力检验 C2: 正式阶段内部重复
+let ac2Rows=S.ratings.filter(r=>r.is_ac2==='1');
+let ac2Passed=null;
+if(ac2Rows.length===2){
+  let a=ac2Rows[0],b=ac2Rows[1];
+  ac2Passed=[Math.abs(a.FLD-b.FLD),Math.abs(a.GEO-b.GEO),Math.abs(a.FIR-b.FIR)].every(d=>d<=2);
+}
+// 指令检验 C3: "本题请选4"
+let instrRow=S.ratings.filter(r=>r.is_instr==='1')[0];
+let instrPassed=instrRow?instrRow.instr_passed:null;
+let payload={participant_id:S.pid,demographics:{age:S.age,chongqing_years:S.cq},feedback:fb,
+  ac1_passed:ac1Passed,ac2_passed:ac2Passed,instr_passed:instrPassed,n_ratings:S.ratings.length};
 try{
   let resp=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),keepalive:true});
   let d=await resp.json();
