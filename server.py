@@ -395,7 +395,7 @@ ${imgGrid(g)}
 FLD 积水可能性 = <strong>${ref.FLD}/7</strong> &nbsp;|&nbsp;
 GEO 滑坡可能性 = <strong>${ref.GEO}/7</strong> &nbsp;|&nbsp;
 FIR 疏散难度 = <strong>${ref.FIR}/7</strong>
-<div style="font-size:.75em;color:#888;margin-top:4px">参考分由AI根据图像特征估算，仅供建立参照系</div></div>
+<div style="font-size:.75em;color:#888;margin-top:4px">参考分由AI根据图像特征估算，仅供建立参照系。请点击下方「评分线索速查」理解每个分数的含义。</div></div>
 ${cueToggle()}
 <div class="btns"><button class="btn ${S.currentIdx<S.currentList.length-1?'btn-p':'btn-g'}" onclick="nextAnchor()">${S.currentIdx<S.currentList.length-1?'下一张 →':'进入练习 →'}</button></div>`;
 }
@@ -410,6 +410,8 @@ ${prev?feedbackBox(prev):''}
 ${imgGrid(g)}
 ${cueToggle()}
 ${ratingForm('practice')}
+${scaleTracker()}
+${fastWarn()}
 <div class="btns"><button class="btn btn-p" id="sub" disabled onclick="subPractice()">${S.currentIdx<S.currentList.length-1?'提交→下一张':'提交→正式评分'}</button></div>`;
 }
 
@@ -424,6 +426,8 @@ ${acWarn}
 ${imgGrid(g)}
 ${cueToggle()}
 ${ratingForm('main')}
+${scaleTracker()}
+${fastWarn()}
 <div class="btns"><button class="btn btn-p" id="sub" disabled onclick="subMain()">${S.currentIdx<S.currentList.length-1?'提交→下一组':'提交→反馈问卷'}</button></div>`;
 }
 
@@ -453,13 +457,22 @@ return '<div class="imgs">'+dirs.map((d,i)=>`<div><img src="/img/${gid}/${d}" al
 }
 
 function cueToggle(){
-return `<div class="cue-toggle"><button onclick="document.getElementById('cuecard').classList.toggle('show')">评分线索速查（点击展开/收起）</button></div>
-<div class="cue-card" id="cuecard"><table>
+return `<div class="cue-toggle"><button onclick="document.getElementById('cuecard').classList.toggle('show')">📋 评分线索速查（点击展开/收起）</button></div>
+<div class="cue-card" id="cuecard">
+<table>
 <tr><th>灾种</th><th>高风险（→7分）</th><th>低风险（→1分）</th></tr>
-<tr><td><strong>FLD 洪涝</strong></td><td>硬质路面、峡谷感、低洼、无绿化</td><td>透水地面、开阔、坡顶、排水可见</td></tr>
-<tr><td><strong>GEO 边坡</strong></td><td>裸岩/土坡、挡土墙密集、路贴陡坡</td><td>平坦、无坡面</td></tr>
-<tr><td><strong>FIR 火灾</strong></td><td>建筑密集无间距、巷道窄、占道</td><td>建筑稀疏、道路宽、有开阔场地</td></tr>
-</table><p style="font-size:.72em;color:#888;margin-top:4px">1=最低 · 4=中等 · 7=最高 &nbsp;|&nbsp;三题独立判断</p></div>`;
+<tr><td><strong>FLD 洪涝</strong></td><td>硬质路面全覆盖、峡谷感（SVF低）、低洼、无绿化</td><td>透水地面、开阔、坡顶、排水可见</td></tr>
+<tr><td><strong>GEO 边坡</strong></td><td>裸岩/土坡可见、挡土墙密集、路贴陡坡</td><td>完全平坦、无坡面 → <b>直接1分</b></td></tr>
+<tr><td><strong>FIR 火灾</strong></td><td>建筑密集无间距、巷道窄、占道停车</td><td>建筑稀疏、道路宽、有开阔场地</td></tr>
+</table>
+<div style="margin-top:10px;padding:10px;background:#fff3cd;border-radius:6px;font-size:.75em">
+<strong>⚠️ FLD vs FIR 怎么区分？</strong><br>
+• FLD 看<b>地面</b>（能不能透水）→ 硬化路面积水，泥土地不积水<br>
+• FIR 看<b>道路</b>（能不能跑出去）→ 窄巷子难疏散，宽阔道路容易疏散<br>
+• 同一个地方可以 FLD=高 FIR=低（宽阔硬化广场），也可以 FLD=低 FIR=高（窄巷透水砖路）<br>
+• <b>不要因为"这里看着危险"就把三个都打高分</b>
+</div>
+<p style="font-size:.72em;color:#888;margin-top:4px">1=最低 · 4=中等 · 7=最高 &nbsp;|&nbsp; 三个灾种独立判断</p></div>`;
 }
 
 function ratingForm(phase){
@@ -482,6 +495,37 @@ for(let k of ['FLD','GEO','FIR']){
   h+='</div></div>';
 }
 return h;
+}
+
+function getUsedValues(){
+  let used={FLD:new Set(),GEO:new Set(),FIR:new Set()};
+  S.ratings.forEach(r=>{['FLD','GEO','FIR'].forEach(k=>used[k].add(r[k]));});
+  return used;
+}
+function scaleTracker(){
+  let used=getUsedValues();
+  let h='<div style="background:#f0f2f5;border-radius:8px;padding:10px 14px;margin:10px 0;font-size:.78em">';
+  h+='<strong>📊 分值使用情况</strong>（请用满1-7）：';
+  for(let k of ['FLD','GEO','FIR']){
+    let bars='';
+    for(let v=1;v<=7;v++){
+      let c=used[k].has(v)?'#0984e3':'#dfe6e9';
+      bars+=`<span style="display:inline-block;width:26px;height:20px;line-height:20px;text-align:center;
+        background:${c};color:${used[k].has(v)?'#fff':'#b2bec3'};border-radius:3px;margin:1px;font-size:.75em">${v}</span>`;
+    }
+    h+=`<br>${k}: ${bars}`;
+  }
+  let totalUsed=new Set([...used.FLD,...used.GEO,...used.FIR]).size;
+  if(totalUsed<5)h+='<br><span style="color:#e17055">⚠️ 你只用了'+totalUsed+'个不同分值，请尝试使用更极端的分数（1和7）</span>';
+  h+='</div>';
+  return h;
+}
+function fastWarn(){
+  if(S.ratings.length<3)return'';
+  let recent=S.ratings.slice(-3);
+  let allFast=recent.every(r=>r.response_time_sec<8);
+  if(allFast)return'<div style="background:#ffeaa7;border:1px solid #fdcb6e;padding:8px 14px;border-radius:6px;font-size:.8em;margin:8px 0">⚠️ 最近3题作答都很快（<8秒），请仔细观看每张图片后再评分。</div>';
+  return'';
 }
 
 function feedbackBox(r){
