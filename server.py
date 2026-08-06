@@ -217,7 +217,7 @@ class Handler(BaseHTTPRequestHandler):
             w.writerow([pid, body.get('phase', ''), body.get('grid_id', ''),
                         body.get('is_ac', ''),
                         body.get('FLD', ''), body.get('GEO', ''), body.get('FIR', ''),
-                        round(body.get('response_time_sec', 0), 1)])
+                        round(float(body.get('response_time_sec', 0)), 1)])
         # Also save demographics on first call for this participant
         demo = body.get('demographics')
         if demo:
@@ -502,7 +502,7 @@ function getR(){return{FLD:parseInt(document.querySelector('input[name="q_FLD"]:
 let _demoSent=false;
 function saveOne(phase,grid_id,r,is_ac){
   let payload={participant_id:S.pid,phase,grid_id,FLD:r.FLD,GEO:r.GEO,FIR:r.FIR,
-               response_time_sec:((Date.now()-S.qStart)/1000).toFixed(1),
+               response_time_sec:Math.round((Date.now()-S.qStart)/100)/10,
                is_ac:is_ac?'1':''};
   if(!_demoSent){payload.demographics={age:S.age,chongqing_years:S.cq};_demoSent=true}
   fetch('/save-one',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),keepalive:true}).catch(()=>{});
