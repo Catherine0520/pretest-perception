@@ -101,6 +101,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/save': self._save()
+        elif self.path == '/save-one': self._save_one()
         else: self.send_error(404)
 
     def _json(self, data):
@@ -139,13 +140,12 @@ class Handler(BaseHTTPRequestHandler):
         self._json(REF_SCORES.get(gid, {'FLD': 4, 'GEO': 4, 'FIR': 4}))
 
     def _admin(self):
-        # List all saved rating data + download links
-        files = sorted(
-            [f for f in DATA_DIR.glob('pretest_*.csv')
-             if not f.name.startswith('pretest_sample') and not f.name.startswith('pretest_image')],
-            reverse=True)
+        # List all saved rating data + download links + diagnostics
+        all_csvs = sorted(DATA_DIR.glob('*.csv'), reverse=True)
+        rating_files = [f for f in all_csvs
+                        if not f.name.startswith('pretest_sample') and not f.name.startswith('pretest_image')]
         rows = ''
-        for f in files:
+        for f in rating_files:
             name = f.name
             # Count lines minus header
             try:
@@ -162,25 +162,54 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(page.encode())
 
     def _save(self):
+        """保存反馈问卷（评分已通过 /save-one 逐条保存）"""
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length))
         pid = body.get('participant_id', 'unknown')
         ts = time.strftime('%Y%m%d_%H%M%S')
-        csv_path = DATA_DIR / f'pretest_{pid}_{ts}.csv'
+        # 兼容旧版：如果 ratings 有数据，也保存一份完整 CSV 作为备份
         ratings = body.get('ratings', [])
-        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            w = csv.writer(f)
-            w.writerow(['participant_id','phase','grid_id','is_attention_check','FLD','GEO','FIR','response_time_sec'])
-            for r in ratings:
-                w.writerow([pid, r.get('phase',''), r.get('grid_id',''), r.get('is_ac',''),
-                           r.get('FLD',''), r.get('GEO',''), r.get('FIR',''),
-                           round(r.get('response_time_sec',0),1)])
+        if ratings:
+            csv_path = DATA_DIR / f'pretest_{pid}_{ts}.csv'
+            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                w.writerow(['participant_id','phase','grid_id','is_attention_check','FLD','GEO','FIR','response_time_sec'])
+                for r in ratings:
+                    w.writerow([pid, r.get('phase',''), r.get('grid_id',''), r.get('is_ac',''),
+                               r.get('FLD',''), r.get('GEO',''), r.get('FIR',''),
+                               round(r.get('response_time_sec',0),1)])
+            print(f"SAVED: {csv_path.name}")
         fb_path = DATA_DIR / f'pretest_feedback_{pid}_{ts}.json'
         fb_path.write_text(json.dumps({'participant_id':pid,'demographics':body.get('demographics',{}),
-            'feedback':body.get('feedback',{}),'n_ratings':len(ratings),
+            'feedback':body.get('feedback',{}),'n_ratings':body.get('n_ratings',len(ratings)),
             'attention_check_passed':body.get('ac_passed')}, ensure_ascii=False, indent=2))
-        print(f"SAVED: {csv_path.name}")
-        self._json({'status':'ok','filename':csv_path.name,'ratings_count':len(ratings)})
+        self._json({'status':'ok','ratings_count':body.get('n_ratings',0)})
+
+    def _save_one(self):
+        """逐条保存：每完成一条评分立即写入，防止中途退出丢数据"""
+        length = int(self.headers.get('Content-Length', 0))
+        body = json.loads(self.rfile.read(length))
+        pid = body.get('participant_id', 'unknown')
+        csv_path = DATA_DIR / f'pretest_{pid}.csv'
+        is_new = not csv_path.exists()
+        with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            if is_new:
+                w.writerow(['participant_id', 'phase', 'grid_id', 'is_attention_check',
+                            'FLD', 'GEO', 'FIR', 'response_time_sec'])
+            w.writerow([pid, body.get('phase', ''), body.get('grid_id', ''),
+                        body.get('is_ac', ''),
+                        body.get('FLD', ''), body.get('GEO', ''), body.get('FIR', ''),
+                        round(body.get('response_time_sec', 0), 1)])
+        # Also save demographics on first call for this participant
+        demo = body.get('demographics')
+        if demo:
+            demo_path = DATA_DIR / f'pretest_demo_{pid}.json'
+            if not demo_path.exists():
+                demo_path.write_text(json.dumps({
+                    'participant_id': pid, 'demographics': demo
+                }, ensure_ascii=False, indent=2))
+        self._json({'status': 'ok', 'saved': body.get('grid_id', '')})
 
 # ============================================================
 # HTML (same as v2 local)
@@ -453,11 +482,20 @@ S.phase='anchor';S.currentList=S.anchors;S.currentIdx=0;R();
 function nextAnchor(){S.currentIdx++;if(S.currentIdx>=S.currentList.length){S.phase='practice';S.currentList=S.train;S.currentIdx=0;S.trainResults=Array(S.train.length).fill(null)}R();}
 function chk(){let b=document.getElementById('sub');if(b)b.disabled=['FLD','GEO','FIR'].some(k=>!document.querySelector(`input[name="q_${k}"]:checked`));}
 function getR(){return{FLD:parseInt(document.querySelector('input[name="q_FLD"]:checked')?.value||'0'),GEO:parseInt(document.querySelector('input[name="q_GEO"]:checked')?.value||'0'),FIR:parseInt(document.querySelector('input[name="q_FIR"]:checked')?.value||'0')};}
+let _demoSent=false;
+function saveOne(phase,grid_id,r,is_ac){
+  let payload={participant_id:S.pid,phase,grid_id,FLD:r.FLD,GEO:r.GEO,FIR:r.FIR,
+               response_time_sec:((Date.now()-S.qStart)/1000).toFixed(1),
+               is_ac:is_ac?'1':''};
+  if(!_demoSent){payload.demographics={age:S.age,chongqing_years:S.cq};_demoSent=true}
+  fetch('/save-one',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),keepalive:true}).catch(()=>{});
+}
 function subPractice(){
 let r=getR();if(!r.FLD||!r.GEO||!r.FIR)return;
 let g=S.currentList[S.currentIdx],rt=(Date.now()-S.qStart)/1000,ref=S.refs[g]||{FLD:4,GEO:4,FIR:4};
 S.trainResults[S.currentIdx]={...r,rFLD:ref.FLD,rGEO:ref.GEO,rFIR:ref.FIR};
 S.ratings.push({phase:'practice',grid_id:g,...r,response_time_sec:rt,is_ac:''});
+saveOne('practice',g,r,false);
 S.currentIdx++;
 if(S.currentIdx>=S.currentList.length){let m=[...S.main];if(S.attnGrid&&S.attnPos<m.length)m.splice(S.attnPos,0,S.attnGrid);S.currentList=m;S.currentIdx=0;S.phase='main';}
 R();S.qStart=Date.now();
@@ -466,6 +504,7 @@ function subMain(){
 let r=getR();if(!r.FLD||!r.GEO||!r.FIR)return;
 let g=S.currentList[S.currentIdx],rt=(Date.now()-S.qStart)/1000,isAC=(g===S.attnGrid&&S.currentIdx===S.attnPos);
 S.ratings.push({phase:'main',grid_id:g,...r,response_time_sec:rt,is_ac:isAC?'1':''});
+saveOne('main',g,r,isAC);
 S.currentIdx++;if(S.currentIdx>=S.currentList.length)S.phase='feedback';
 R();S.qStart=Date.now();
 }
@@ -474,9 +513,9 @@ let fb={};for(let i=1;i<=9;i++)fb['Q'+i]=document.getElementById('f'+i)?.value||
 let pracR=S.trainResults[1],mainR=S.ratings.filter(r=>r.grid_id===S.attnGrid&&r.phase==='main')[0];
 let acPassed=null;
 if(pracR&&mainR)acPassed=[Math.abs(pracR.FLD-mainR.FLD),Math.abs(pracR.GEO-mainR.GEO),Math.abs(pracR.FIR-mainR.FIR)].every(d=>d<=2);
-let payload={participant_id:S.pid,demographics:{age:S.age,chongqing_years:S.cq},ratings:S.ratings,feedback:fb,timestamp:new Date().toISOString(),ac_passed:acPassed};
+let payload={participant_id:S.pid,demographics:{age:S.age,chongqing_years:S.cq},feedback:fb,ac_passed:acPassed,n_ratings:S.ratings.length};
 try{
-  let resp=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  let resp=await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),keepalive:true});
   let d=await resp.json();
   if(d.status==='ok')S.phase='complete';
 }catch(e){}
