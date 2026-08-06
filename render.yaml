@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: pretest-perception
+    runtime: python
+    buildCommand: pip install pandas==2.2.3
+    startCommand: python server.py
+    plan: free
