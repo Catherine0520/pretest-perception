@@ -7,32 +7,47 @@ import os, sys, json, csv, time, random, socket
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
-import pandas as pd
 
-# Paths relative to this server file
 HERE = Path(__file__).parent
 DATA_DIR = HERE / "data"
 IMG_DIR = HERE / "images"
 
-SAMPLE = pd.read_csv(DATA_DIR / "pretest_sample_30_v1.csv")
-IMAGES = pd.read_csv(DATA_DIR / "pretest_image_list_30_v1.csv")
+# --- Read CSVs with stdlib only (no pandas → fast Render build) ---
+def read_csv(path):
+    with open(path, newline='', encoding='utf-8') as f:
+        return list(csv.DictReader(f))
+
+SAMPLE = read_csv(DATA_DIR / "pretest_sample_30_v1.csv")
+IMAGES = read_csv(DATA_DIR / "pretest_image_list_30_v1.csv")
+
+# Convert numeric fields
+for r in SAMPLE:
+    for k in ['FLD_cue','GEO_cue','FIR_cue','BEI','GVI','SVF','SWI','ORI_FLD_pct','complexity','naturalness']:
+        if k in r: r[k] = float(r[k]) if r[k] else 0.0
 
 # Image lookup: {grid_id: {direction_str: filename}}
 IMG_LOOKUP = {}
-for _, row in IMAGES.iterrows():
+for row in IMAGES:
     gid = row['grid_id']
-    d = str(int(row['direction']))
+    d = str(int(float(row['direction'])))
     IMG_LOOKUP.setdefault(gid, {})[d] = f"{gid}_{d}.jpg"
 
 ALL_GRIDS = sorted(IMG_LOOKUP.keys())
 random.seed(20260824)
 
+# --- Phase assignment ---
+def nlargest(key, n, rows):
+    return sorted(rows, key=lambda r: r[key], reverse=True)[:n]
+
+def nsmallest(key, n, rows):
+    return sorted(rows, key=lambda r: r[key])[:n]
+
 def select_anchors():
     anchors = []
     for cue, asc in [('FLD_cue',True),('FLD_cue',False),('GEO_cue',True),('GEO_cue',False),
                       ('FIR_cue',True),('FIR_cue',False),('BEI',True),('GVI',True)]:
-        candidates = SAMPLE.nlargest(5, cue) if asc else SAMPLE.nsmallest(5, cue)
-        for _, row in candidates.iterrows():
+        candidates = nlargest(cue, 5, SAMPLE) if asc else nsmallest(cue, 5, SAMPLE)
+        for row in candidates:
             if row['grid_id'] not in anchors:
                 anchors.append(row['grid_id']); break
     if len(anchors) < 8:
@@ -49,15 +64,21 @@ TRAINING_GRIDS = remaining[:6]
 MAIN_GRIDS = remaining[6:]
 ATTN_GRID = TRAINING_GRIDS[1] if len(TRAINING_GRIDS) > 1 else None
 
+# --- AI reference scores ---
+SAMPLE_BY_ID = {r['grid_id']: r for r in SAMPLE}
+ALL_CUES = {k: [r[k] for r in SAMPLE if r[k] is not None] for k in ['FLD_cue','GEO_cue','FIR_cue']}
+
 def compute_refs():
     refs = {}
     for gid in ALL_GRIDS:
-        row = SAMPLE[SAMPLE['grid_id'] == gid].iloc[0]
-        refs[gid] = {
-            'FLD': max(1, min(7, round((SAMPLE['FLD_cue'] < row['FLD_cue']).mean() * 6 + 1))),
-            'GEO': max(1, min(7, round((SAMPLE['GEO_cue'] < row['GEO_cue']).mean() * 6 + 1))),
-            'FIR': max(1, min(7, round((SAMPLE['FIR_cue'] < row['FIR_cue']).mean() * 6 + 1))),
-        }
+        row = SAMPLE_BY_ID[gid]
+        ref = {}
+        for cue in ['FLD_cue','GEO_cue','FIR_cue']:
+            vals = ALL_CUES[cue]
+            rank = sum(1 for v in vals if v < row[cue]) / len(vals)
+            label = cue.replace('_cue','').upper()
+            ref[label] = max(1, min(7, round(rank * 6 + 1)))
+        refs[gid] = ref
     return refs
 
 REF_SCORES = compute_refs()
