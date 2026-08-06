@@ -140,7 +140,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _admin(self):
         # List all saved rating data + download links
-        files = sorted(DATA_DIR.glob('pretest_P*.csv'), reverse=True)
+        files = sorted(
+            [f for f in DATA_DIR.glob('pretest_*.csv')
+             if not f.name.startswith('pretest_sample') and not f.name.startswith('pretest_image')],
+            reverse=True)
         rows = ''
         for f in files:
             name = f.name
