@@ -50,7 +50,7 @@ ALL_GRIDS_POOL = sorted(IMG_LOOKUP.keys())
 random.seed(20260807)
 
 def compute_refs():
-    """Compute 1-7 reference scores from available features."""
+    """Compute 1-5 reference scores from available features."""
     refs = {}
     # Collect feature values
     fld_vals = []
@@ -70,18 +70,18 @@ def compute_refs():
             fir_vals.append((gid, float(row.get('BEI', 0))))
         except: pass
 
-    # Sort and assign percentile-based scores 1-7
+    # Sort and assign percentile-based scores 1-5
     for label, pairs in [('FLD', fld_vals), ('GEO', geo_vals), ('FIR', fir_vals)]:
         sorted_pairs = sorted(pairs, key=lambda x: x[1])
         n = len(sorted_pairs)
         for rank, (gid, _) in enumerate(sorted_pairs):
-            score = max(1, min(7, round(rank / max(n-1, 1) * 6 + 1)))
+            score = max(1, min(5, round(rank / max(n-1, 1) * 4 + 1)))
             refs.setdefault(gid, {})[label] = score
 
-    # Fill missing with 4
+    # Fill missing with 3
     for gid in ALL_GRIDS_POOL:
         if gid not in refs:
-            refs[gid] = {'FLD': 4, 'GEO': 4, 'FIR': 4}
+            refs[gid] = {'FLD': 3, 'GEO': 3, 'FIR': 3}
     return refs
 
 REF_SCORES = compute_refs()
@@ -447,11 +447,11 @@ if(p===0)return `<div class="top"><h1>灾害风险感知评分任务</h1><div cl
 <p style="color:#888;font-size:.8em">这不是对错测试——不同人的判断可能不同，我们研究的就是这种差异。预计 20-25 分钟。</p>
 ${disasterCards()}
 <h2>流程</h2>
-<p><strong>第1步：</strong>浏览1张锚定示例图 → 了解1-7分"长什么样"</p>
+<p><strong>第1步：</strong>浏览1张锚定示例图 → 了解1-5分"长什么样"</p>
 <p><strong>第2步：</strong>练习评分4张 → 独立评分后查看对比</p>
 <p><strong>第3步：</strong>正式评分15张 → 独立判断</p>
 <p><strong>第4步：</strong>填写简短反馈 → 完成</p>
-<div class="warn-box"><strong>⚠ 请使用1-7的整个范围</strong>。如果图像确实极端，就打1或7。不要全部集中在3-5分。</div>
+<div class="warn-box"><strong>⚠ 请使用1-5的整个范围</strong>。如果图像确实极端，就打1或5。不要全部集中在3分。</div>
 </div>
 <div class="pool-info">📊 总格网池: ${S.totalPool} | 待完成: ${S.remaining} | 您的15组正式评分将从待评格网中随机分配</div>
 <div class="btns"><button class="btn btn-p" onclick="S.page=1;R()">下一页：评分指南 →</button></div>`;
@@ -498,7 +498,7 @@ return `<div class="disaster-card"><h4>FLD · 洪涝积水</h4>
 
 function cueTable(){
 return `<table style="width:100%;font-size:.83em;border-collapse:collapse;margin:8px 0">
-<tr style="background:#f0f2f5"><th>灾种</th><th>看什么</th><th>高风险（→7分）</th><th>低风险（→1分）</th></tr>
+<tr style="background:#f0f2f5"><th>灾种</th><th>看什么</th><th>高风险（→5分）</th><th>低风险（→1分）</th></tr>
 <tr><td><strong>FLD 洪涝</strong></td><td><b>地面渗透性</b></td><td>硬质路面全覆盖、峡谷感、低洼、无绿化</td><td>透水地面、开阔、坡顶、排水可见</td></tr>
 <tr><td><strong>GEO 边坡</strong></td><td><b>有无坡面</b></td><td>裸岩/土坡可见、挡土墙密集、路贴陡坡</td><td>完全平坦、无坡面 → <b>直接1分</b></td></tr>
 <tr><td><strong>FIR 火灾</strong></td><td><b>道路通行性</b></td><td>建筑密集无间距、巷道窄、占道停车</td><td>建筑稀疏、道路宽、有开阔场地</td></tr>
@@ -517,10 +517,10 @@ return `<div class="top"><h1>第1步：锚定浏览</h1><div class="sub">了解�
 <div class="steps"><span class="on">锚定</span><span>练习</span><span>正式评分</span></div>
 <div style="text-align:center;color:#888;font-size:.8em;margin:6px 0">唯一锚定示例</div>
 ${imgGrid(g)}
-<div class="card ref-box"><strong>AI 参考分（帮您建立1-7的参照）：</strong><br>
-FLD 积水可能性 = <strong>${ref.FLD}/7</strong> &nbsp;|&nbsp;
-GEO 滑坡可能性 = <strong>${ref.GEO}/7</strong> &nbsp;|&nbsp;
-FIR 疏散难度 = <strong>${ref.FIR}/7</strong>
+<div class="card ref-box"><strong>AI 参考分（帮您建立1-5的参照）：</strong><br>
+FLD 积水可能性 = <strong>${ref.FLD}/5</strong> &nbsp;|&nbsp;
+GEO 滑坡可能性 = <strong>${ref.GEO}/5</strong> &nbsp;|&nbsp;
+FIR 疏散难度 = <strong>${ref.FIR}/5</strong>
 <div style="font-size:.75em;color:#888;margin-top:4px">请对照下方线索速查表理解每个分数的含义</div></div>
 ${cueToggle()}
 <div class="btns"><button class="btn btn-g" onclick="nextAnchor()">进入练习 →</button></div>`;
@@ -566,7 +566,7 @@ return `<div class="top"><h1>反馈问卷</h1></div>
 <label>3. 评分时主要看图像的哪些特征？</label><textarea id="f3" rows="2"></textarea>
 <label>4. 有没有"看着舒服"但给了高风险，或反之？</label><textarea id="f4" rows="2"></textarea>
 <label>5. 洪水风险和火灾疏散难度——如何区分？</label><textarea id="f5" rows="2"></textarea>
-<label>6. 1-7分范围够用吗？</label><textarea id="f6" rows="1"></textarea>
+<label>6. 1-5分范围够用吗？</label><textarea id="f6" rows="1"></textarea>
 <label>7. 评分标准前后有变化吗？</label><textarea id="f7" rows="1"></textarea>
 <label>8. 有什么困惑？</label><textarea id="f8" rows="2"></textarea>
 <label>9. 有什么建议？</label><textarea id="f9" rows="2"></textarea>
@@ -591,14 +591,14 @@ return `<div class="cue-toggle"><button onclick="document.getElementById('cuecar
 function ratingForm(phase,instrHazard){
 let scales={
   FLD:{q:'Q1. 如果发生暴雨，从街景来看，这个地方<b>积水</b>的可能性有多大？',
-       tip:'1=几乎不可能积水 · 4=中等 · 7=几乎必定积水',
-       lbls:['几乎不可能\\n积水','可能性\\n很低','可能性\\n较低','中等','可能性\\n较高','可能性\\n很高','几乎必定\\n积水']},
+       tip:'1=极低 · 3=中等 · 5=极高',
+       lbls:['极低\\n几乎不积水','较低\\n不太可能','中等\\n有可能','较高\\n很可能','极高\\n几乎必定']},
   GEO:{q:'Q2. 从街景来看，这个地方发生<b>滑坡/崩塌</b>的可能性有多大？',
-       tip:'1=完全无风险 · 4=中等 · 7=极端风险 · 看不到坡面→直接1分',
-       lbls:['完全\\n无风险','风险\\n极低','风险\\n较低','中等','风险\\n较高','风险\\n很高','极端\\n风险']},
+       tip:'1=极低 · 3=中等 · 5=极高 · 看不到坡面→直接1分',
+       lbls:['极低\\n完全无风险','较低\\n风险不大','中等\\n有风险','较高\\n风险较大','极高\\n极端风险']},
   FIR:{q:'Q3. 如果附近建筑发生火灾，从街景来看，<b>疏散和消防车</b>到达有多困难？',
-       tip:'1=极容易疏散 · 4=中等 · 7=几乎无法疏散',
-       lbls:['极容易\\n疏散','很容易\\n疏散','较容易\\n疏散','中等','较困难\\n疏散','很困难\\n疏散','几乎无法\\n疏散']}
+       tip:'1=极低 · 3=中等 · 5=极高',
+       lbls:['极低\\n极容易疏散','较低\\n较容易','中等\\n有一定难度','较高\\n较困难','极高\\n几乎无法疏散']}
 };
 if(instrHazard && scales[instrHazard]){
   scales[instrHazard].q='<span style="color:#e17055">【指令检验】本题请选4。</span> '+scales[instrHazard].q;
@@ -608,7 +608,7 @@ let h='';
 for(let k of ['FLD','GEO','FIR']){
   let s=scales[k];
   h+=`<div class="q-block"><h3>${s.q}</h3><div class="tip">${s.tip}</div><div class="scale">`;
-  for(let v=1;v<=7;v++)h+=`<label><input type="radio" name="q_${k}" value="${v}" onchange="chk()"><span class="dot">${v}</span><span class="lbl">${s.lbls[v-1]}</span></label>`;
+  for(let v=1;v<=5;v++)h+=`<label><input type="radio" name="q_${k}" value="${v}" onchange="chk()"><span class="dot">${v}</span><span class="lbl">${s.lbls[v-1]}</span></label>`;
   h+='</div></div>';
 }
 return h;
@@ -622,10 +622,10 @@ function getUsedValues(){
 function scaleTracker(){
   let used=getUsedValues();
   let h='<div style="background:#f0f2f5;border-radius:8px;padding:10px 14px;margin:10px 0;font-size:.78em">';
-  h+='<strong>📊 分值使用情况</strong>（请用满1-7）：';
+  h+='<strong>📊 分值使用情况</strong>（请用满1-5）：';
   for(let k of ['FLD','GEO','FIR']){
     let bars='';
-    for(let v=1;v<=7;v++){
+    for(let v=1;v<=5;v++){
       let c=used[k].has(v)?'#0984e3':'#dfe6e9';
       bars+=`<span style="display:inline-block;width:26px;height:20px;line-height:20px;text-align:center;
         background:${c};color:${used[k].has(v)?'#fff':'#b2bec3'};border-radius:3px;margin:1px;font-size:.75em">${v}</span>`;
@@ -633,7 +633,7 @@ function scaleTracker(){
     h+=`<br>${k}: ${bars}`;
   }
   let totalUsed=new Set([...used.FLD,...used.GEO,...used.FIR]).size;
-  if(totalUsed<5)h+='<br><span style="color:#e17055">⚠️ 你只用了'+totalUsed+'个不同分值，请尝试使用更极端的分数（1和7）</span>';
+  if(totalUsed<4)h+='<br><span style="color:#e17055">⚠️ 你只用了'+totalUsed+'个不同分值，请尝试使用更极端的分数（1和5）</span>';
   h+='</div>';
   return h;
 }
