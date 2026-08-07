@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 data/pretest_P*.csv
 data/pretest_feedback_*.json
+data/rating_counts.json
+data/pretest_demo_*.json

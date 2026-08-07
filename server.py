@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-感知评分预测试 — 云端部署版
-访问：部署后 Render 提供的 URL
+感知评分实验 — 400格网池 v4
+每组实验: 1锚定 + 4练习 + 15正式 = 20组
+每格网目标: 5次独立评分
 """
-import os, sys, json, csv, time, random, socket
+import os, sys, json, csv, time, random, socket, re
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
@@ -12,82 +13,116 @@ HERE = Path(__file__).parent
 DATA_DIR = HERE / "data"
 IMG_DIR = HERE / "images"
 
-# --- Read CSVs with stdlib only (no pandas → fast Render build) ---
+# --- Read CSVs ---
 def read_csv(path):
     with open(path, newline='', encoding='utf-8') as f:
         return list(csv.DictReader(f))
 
-SAMPLE = read_csv(DATA_DIR / "pretest_sample_30_v1.csv")
-IMAGES = read_csv(DATA_DIR / "pretest_image_list_30_v1.csv")
+SAMPLE = read_csv(DATA_DIR / "perception_rating_sample_v1.csv")
+IMG_LIST = read_csv(DATA_DIR / "perception_rating_image_list_v1.csv")
 
-# Convert numeric fields
-for r in SAMPLE:
-    for k in ['FLD_cue','GEO_cue','FIR_cue','BEI','GVI','SVF','SWI','ORI_FLD_pct','complexity','naturalness']:
-        if k in r: r[k] = float(r[k]) if r[k] else 0.0
-
-# Image lookup: {grid_id: {direction_str: filename}}
+# --- Image lookup: {grid_id: {direction_str: filename}} ---
 IMG_LOOKUP = {}
-for row in IMAGES:
+GRID_LATLON = {}  # {grid_id: (lat, lon)}
+for row in IMG_LIST:
     gid = row['grid_id']
     d = str(int(float(row['direction'])))
-    IMG_LOOKUP.setdefault(gid, {})[d] = f"{gid}_{d}.jpg"
+    fname = row['filename']
+    IMG_LOOKUP.setdefault(gid, {})[d] = fname
+    # Extract lat/lon from filename: {point_id}_{lon}_{lat}_{direction}_{date}.jpg
+    if gid not in GRID_LATLON:
+        m = re.match(r'\d+_([\d.]+)_([\d.]+)_\d+_\d+\.jpg', fname)
+        if m:
+            GRID_LATLON[gid] = (float(m.group(2)), float(m.group(1)))  # lat, lon
 
-ALL_GRIDS = sorted(IMG_LOOKUP.keys())
-random.seed(20260824)
+# --- Grid metadata ---
+GRID_META = {}
+for row in SAMPLE:
+    gid = row['grid_id']
+    GRID_META[gid] = {
+        'district': row.get('district', ''),
+        'ori_level': row.get('ori_level', ''),
+        'urban_type': row.get('urban_type', ''),
+    }
 
-# --- Phase assignment ---
-def nlargest(key, n, rows):
-    return sorted(rows, key=lambda r: r[key], reverse=True)[:n]
-
-def nsmallest(key, n, rows):
-    return sorted(rows, key=lambda r: r[key])[:n]
-
-def select_anchors():
-    anchors = []
-    for cue, asc in [('FLD_cue',True),('FLD_cue',False),('GEO_cue',True),('GEO_cue',False),
-                      ('FIR_cue',True),('FIR_cue',False),('BEI',True),('GVI',True)]:
-        candidates = nlargest(cue, 5, SAMPLE) if asc else nsmallest(cue, 5, SAMPLE)
-        for row in candidates:
-            if row['grid_id'] not in anchors:
-                anchors.append(row['grid_id']); break
-    if len(anchors) < 8:
-        for gid in ALL_GRIDS:
-            if gid not in anchors:
-                anchors.append(gid)
-                if len(anchors) >= 8: break
-    return anchors[:8]
-
-ANCHOR_GRIDS = select_anchors()
-remaining = [g for g in ALL_GRIDS if g not in ANCHOR_GRIDS]
-random.shuffle(remaining)
-TRAINING_GRIDS = remaining[:6]
-MAIN_GRIDS = remaining[6:]
-ATTN_GRID = TRAINING_GRIDS[1] if len(TRAINING_GRIDS) > 1 else None
-# 第2注意力检验：从正式阶段随机选一张在后期重复
-ATTN_GRID_2 = MAIN_GRIDS[3] if len(MAIN_GRIDS) > 3 else None
-ATTN_POS_2 = 13  # 在第13位重复（正式阶段过半后）
-# 指令检验：随机选一个灾种和一组图，嵌入"本题请选4"
-INSTR_CHECK_GRID = MAIN_GRIDS[6] if len(MAIN_GRIDS) > 6 else None
-INSTR_CHECK_HAZARD = 'GEO'  # 在 GEO 问题上嵌入指令（GEO 最容易被忽略）
-
-# --- AI reference scores ---
-SAMPLE_BY_ID = {r['grid_id']: r for r in SAMPLE}
-ALL_CUES = {k: [r[k] for r in SAMPLE if r[k] is not None] for k in ['FLD_cue','GEO_cue','FIR_cue']}
+# --- AI reference scores (computed from sample features) ---
+ALL_GRIDS_POOL = sorted(IMG_LOOKUP.keys())
+random.seed(20260807)
 
 def compute_refs():
+    """Compute 1-7 reference scores from available features."""
     refs = {}
-    for gid in ALL_GRIDS:
-        row = SAMPLE_BY_ID[gid]
-        ref = {}
-        for cue in ['FLD_cue','GEO_cue','FIR_cue']:
-            vals = ALL_CUES[cue]
-            rank = sum(1 for v in vals if v < row[cue]) / len(vals)
-            label = cue.replace('_cue','').upper()
-            ref[label] = max(1, min(7, round(rank * 6 + 1)))
-        refs[gid] = ref
+    # Collect feature values
+    fld_vals = []
+    geo_vals = []
+    fir_vals = []
+    for row in SAMPLE:
+        gid = row['grid_id']
+        if gid not in IMG_LOOKUP:
+            continue
+        try:
+            fld_vals.append((gid, float(row.get('ORI_FLD_pct', 50))))
+        except: pass
+        try:
+            geo_vals.append((gid, float(row.get('SWI', 0))))
+        except: pass
+        try:
+            fir_vals.append((gid, float(row.get('BEI', 0))))
+        except: pass
+
+    # Sort and assign percentile-based scores 1-7
+    for label, pairs in [('FLD', fld_vals), ('GEO', geo_vals), ('FIR', fir_vals)]:
+        sorted_pairs = sorted(pairs, key=lambda x: x[1])
+        n = len(sorted_pairs)
+        for rank, (gid, _) in enumerate(sorted_pairs):
+            score = max(1, min(7, round(rank / max(n-1, 1) * 6 + 1)))
+            refs.setdefault(gid, {})[label] = score
+
+    # Fill missing with 4
+    for gid in ALL_GRIDS_POOL:
+        if gid not in refs:
+            refs[gid] = {'FLD': 4, 'GEO': 4, 'FIR': 4}
     return refs
 
 REF_SCORES = compute_refs()
+
+# --- Fixed anchor and practice grids ---
+# Anchor: 1 extreme grid (high FLD + high FIR)
+ANCHOR_GRID = 'R152C029' if 'R152C029' in ALL_GRIDS_POOL else ALL_GRIDS_POOL[0]
+# Practice: 4 grids covering different risk profiles, with known refs
+PRACTICE_GRIDS = []
+practice_candidates = [g for g in ['R099C070', 'R117C010', 'R161C064', 'R102C103',
+                                     'R137C067', 'R092C045', 'R139C067', 'R122C057']
+                       if g in ALL_GRIDS_POOL]
+if len(practice_candidates) >= 4:
+    PRACTICE_GRIDS = practice_candidates[:4]
+else:
+    PRACTICE_GRIDS = [g for g in ALL_GRIDS_POOL if g != ANCHOR_GRID][:4]
+
+# --- Rating count tracking ---
+COUNTS_PATH = DATA_DIR / "rating_counts.json"
+
+def load_counts():
+    if COUNTS_PATH.exists():
+        return json.loads(COUNTS_PATH.read_text())
+    return {}
+
+def save_counts(counts):
+    COUNTS_PATH.write_text(json.dumps(counts, ensure_ascii=False, indent=2))
+
+def get_least_rated(n=15):
+    """Get n grids with fewest ratings from the pool."""
+    counts = load_counts()
+    # All grids in pool, sorted by count (missing = 0)
+    pool = [(counts.get(g, 0), g) for g in ALL_GRIDS_POOL
+            if g not in [ANCHOR_GRID] + PRACTICE_GRIDS]
+    random.shuffle(pool)  # randomize within same count
+    pool.sort(key=lambda x: x[0])
+    selected = [g for _, g in pool[:n]]
+    return selected
+
+# --- Active session tracking (prevent same grids assigned twice) ---
+ACTIVE_ASSIGNMENTS = {}  # {pid: [grid_ids]} — cleared on save
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
@@ -99,12 +134,8 @@ class Handler(BaseHTTPRequestHandler):
         elif p.startswith('/img/'): self._image(p)
         elif p.startswith('/ref/'): self._ref(p)
         elif p.startswith('/download/'): self._download(p)
-        elif p == '/api/data': self._json({
-            'anchors': ANCHOR_GRIDS, 'training': TRAINING_GRIDS, 'main': MAIN_GRIDS,
-            'refs': REF_SCORES, 'attention_check': ATTN_GRID, 'attention_position': 10,
-            'attention_check_2': ATTN_GRID_2, 'attention_position_2': ATTN_POS_2,
-            'instr_check_grid': INSTR_CHECK_GRID, 'instr_check_hazard': INSTR_CHECK_HAZARD,
-        })
+        elif p == '/api/data': self._api_data()
+        elif p.startswith('/api/meta/'): self._api_meta(p)
         else: self.send_error(404)
 
     def do_POST(self):
@@ -138,18 +169,80 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_response(200)
                     self.send_header('Content-Type', 'image/jpeg')
                     self.send_header('Content-Length', str(len(data)))
-                    self.send_header('Cache-Control', 'max-age=3600')
+                    self.send_header('Cache-Control', 'max-age=86400')
                     self.end_headers(); self.wfile.write(data)
                     return
         self.send_error(404)
 
     def _ref(self, p):
         gid = p.split('/')[-1]
-        self._json(REF_SCORES.get(gid, {'FLD': 4, 'GEO': 4, 'FIR': 4}))
+        ref = REF_SCORES.get(gid, {'FLD': 4, 'GEO': 4, 'FIR': 4})
+        meta = GRID_META.get(gid, {})
+        latlon = GRID_LATLON.get(gid, (None, None))
+        self._json({'ref': ref, 'meta': meta, 'lat': latlon[0], 'lon': latlon[1]})
+
+    def _api_data(self):
+        """Assign grids for a new rater session."""
+        main_grids = get_least_rated(15)
+        self._json({
+            'anchor': [ANCHOR_GRID],
+            'training': PRACTICE_GRIDS,
+            'main': main_grids,
+            'refs': REF_SCORES,
+            'grid_meta': GRID_META,
+            'grid_latlon': GRID_LATLON,
+            'attention_check': PRACTICE_GRIDS[1] if len(PRACTICE_GRIDS) > 1 else None,
+            'attention_position': 10,
+            'attention_check_2': main_grids[3] if len(main_grids) > 3 else None,
+            'attention_position_2': 13,
+            'instr_check_grid': main_grids[6] if len(main_grids) > 6 else None,
+            'instr_check_hazard': 'GEO',
+            'total_pool': len(ALL_GRIDS_POOL),
+            'remaining_under_5': sum(1 for g in ALL_GRIDS_POOL if load_counts().get(g, 0) < 5),
+        })
+
+    def _api_meta(self, p):
+        gid = p.split('/')[-1]
+        if gid in GRID_META:
+            imgs = IMG_LOOKUP.get(gid, {})
+            self._json({
+                'grid_id': gid,
+                'lat': GRID_LATLON.get(gid, (None, None))[0],
+                'lon': GRID_LATLON.get(gid, (None, None))[1],
+                'images': imgs,
+                **GRID_META[gid]
+            })
+        else:
+            self.send_error(404)
+
+    def _admin(self):
+        all_csvs = sorted(DATA_DIR.glob('*.csv'), reverse=True)
+        rating_files = [f for f in all_csvs
+                        if not f.name.startswith('perception_rating')]
+        rows = ''
+        for f in rating_files:
+            name = f.name
+            try:
+                n = len(f.read_text().strip().split('\n')) - 1
+            except: n = '?'
+            rows += f'<tr><td>{name}</td><td>{n} ratings</td><td><a href="/download/{name}">Download</a></td></tr>'
+        if not rows:
+            rows = '<tr><td colspan="3">暂无数据。</td></tr>'
+
+        # Show rating progress
+        counts = load_counts()
+        done_5 = sum(1 for c in counts.values() if c >= 5)
+        done_any = sum(1 for c in counts.values() if c > 0)
+        progress_html = f'<p>📊 格网覆盖: {done_any}/400 已有评分 | {done_5}/400 已满5次</p>'
+
+        page = ADMIN_HTML.replace('{{ROWS}}', rows).replace('{{PROGRESS}}', progress_html)
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(page.encode())
 
     def _download(self, p):
         fname = p.split('/')[-1]
-        # 只允许下载 data 目录中的 CSV 和 JSON 文件
         if not fname or '..' in fname:
             self.send_error(400); return
         fpath = DATA_DIR / fname
@@ -164,72 +257,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _admin(self):
-        # List all saved rating data + download links + diagnostics
-        all_csvs = sorted(DATA_DIR.glob('*.csv'), reverse=True)
-        rating_files = [f for f in all_csvs
-                        if not f.name.startswith('pretest_sample') and not f.name.startswith('pretest_image')]
-        rows = ''
-        for f in rating_files:
-            name = f.name
-            # Count lines minus header
-            try:
-                n = len(f.read_text().strip().split('\n')) - 1
-            except: n = '?'
-            rows += f'<tr><td>{name}</td><td>{n} ratings</td><td><a href="/download/{name}">Download</a></td></tr>'
-        if not rows:
-            rows = '<tr><td colspan="3">暂无数据。参与者提交评分后这里会出现文件。</td></tr>'
-
-        page = ADMIN_HTML.replace('{{ROWS}}', rows)
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(page.encode())
-
-    def _save(self):
-        """保存反馈问卷（评分已通过 /save-one 逐条保存）"""
-        length = int(self.headers.get('Content-Length', 0))
-        body = json.loads(self.rfile.read(length))
-        pid = body.get('participant_id', 'unknown')
-        ts = time.strftime('%Y%m%d_%H%M%S')
-        # 兼容旧版：如果 ratings 有数据，也保存一份完整 CSV 作为备份
-        ratings = body.get('ratings', [])
-        if ratings:
-            csv_path = DATA_DIR / f'pretest_{pid}_{ts}.csv'
-            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-                w = csv.writer(f)
-                w.writerow(['participant_id','phase','grid_id','is_attention_check','FLD','GEO','FIR','response_time_sec'])
-                for r in ratings:
-                    w.writerow([pid, r.get('phase',''), r.get('grid_id',''), r.get('is_ac',''),
-                               r.get('FLD',''), r.get('GEO',''), r.get('FIR',''),
-                               round(r.get('response_time_sec',0),1)])
-            print(f"SAVED: {csv_path.name}")
-        fb_path = DATA_DIR / f'pretest_feedback_{pid}_{ts}.json'
-        fb_path.write_text(json.dumps({'participant_id':pid,'demographics':body.get('demographics',{}),
-            'feedback':body.get('feedback',{}),'n_ratings':body.get('n_ratings',len(ratings)),
-            'attention_check_passed':body.get('ac_passed')}, ensure_ascii=False, indent=2))
-        self._json({'status':'ok','ratings_count':body.get('n_ratings',0)})
-
     def _save_one(self):
-        """逐条保存：每完成一条评分立即写入，防止中途退出丢数据"""
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length))
         pid = body.get('participant_id', 'unknown')
+        gid = body.get('grid_id', '')
         csv_path = DATA_DIR / f'pretest_{pid}.csv'
         is_new = not csv_path.exists()
+
+        # Get lat/lon for this grid
+        lat, lon = GRID_LATLON.get(gid, (None, None))
+        imgs = IMG_LOOKUP.get(gid, {})
+        img_str = '|'.join(f'{d}:{fn}' for d, fn in sorted(imgs.items()))
+
         with open(csv_path, 'a', newline='', encoding='utf-8') as f:
             w = csv.writer(f)
             if is_new:
-                w.writerow(['participant_id', 'phase', 'grid_id', 'is_attention_check',
-                            'is_ac2', 'is_instr', 'instr_hazard', 'instr_passed',
+                w.writerow(['participant_id', 'phase', 'grid_id', 'lat', 'lon',
+                            'images', 'district',
+                            'is_attention_check', 'is_ac2', 'is_instr',
+                            'instr_hazard', 'instr_passed',
                             'FLD', 'GEO', 'FIR', 'response_time_sec'])
-            w.writerow([pid, body.get('phase', ''), body.get('grid_id', ''),
+            w.writerow([pid, body.get('phase', ''), gid,
+                        lat, lon, img_str,
+                        GRID_META.get(gid, {}).get('district', ''),
                         body.get('is_ac', ''), body.get('is_ac2', ''),
                         body.get('is_instr', ''), body.get('instr_hazard', ''),
                         body.get('instr_passed', ''),
                         body.get('FLD', ''), body.get('GEO', ''), body.get('FIR', ''),
                         round(float(body.get('response_time_sec', 0)), 1)])
-        # Also save demographics on first call for this participant
+
+        # Update rating count
+        counts = load_counts()
+        counts[gid] = counts.get(gid, 0) + 1
+        save_counts(counts)
+
+        # Save demographics on first call
         demo = body.get('demographics')
         if demo:
             demo_path = DATA_DIR / f'pretest_demo_{pid}.json'
@@ -237,17 +300,52 @@ class Handler(BaseHTTPRequestHandler):
                 demo_path.write_text(json.dumps({
                     'participant_id': pid, 'demographics': demo
                 }, ensure_ascii=False, indent=2))
-        self._json({'status': 'ok', 'saved': body.get('grid_id', '')})
+
+        self._json({'status': 'ok', 'saved': gid,
+                     'grid_ratings': counts[gid]})
+
+    def _save(self):
+        """保存反馈问卷"""
+        length = int(self.headers.get('Content-Length', 0))
+        body = json.loads(self.rfile.read(length))
+        pid = body.get('participant_id', 'unknown')
+        ts = time.strftime('%Y%m%d_%H%M%S')
+
+        # Also save a backup CSV with all ratings (compat)
+        ratings = body.get('ratings', [])
+        if ratings:
+            csv_path = DATA_DIR / f'pretest_{pid}_{ts}_backup.csv'
+            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                w.writerow(['participant_id','phase','grid_id','is_attention_check',
+                           'FLD','GEO','FIR','response_time_sec'])
+                for r in ratings:
+                    w.writerow([pid, r.get('phase',''), r.get('grid_id',''),
+                               r.get('is_ac',''), r.get('FLD',''), r.get('GEO',''),
+                               r.get('FIR',''), round(r.get('response_time_sec',0),1)])
+
+        fb_path = DATA_DIR / f'pretest_feedback_{pid}_{ts}.json'
+        fb_path.write_text(json.dumps({
+            'participant_id': pid,
+            'demographics': body.get('demographics', {}),
+            'feedback': body.get('feedback', {}),
+            'n_ratings': body.get('n_ratings', len(ratings)),
+            'ac1_passed': body.get('ac1_passed'),
+            'ac2_passed': body.get('ac2_passed'),
+            'instr_passed': body.get('instr_passed'),
+        }, ensure_ascii=False, indent=2))
+
+        self._json({'status': 'ok', 'ratings_count': body.get('n_ratings', 0)})
 
 # ============================================================
-# HTML (same as v2 local)
+# HTML — 与 v3 相同，适配 1+4+15=20 组
 # ============================================================
 HTML = r'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>灾害风险感知评分 — 预测试</title>
+<title>灾害风险感知评分</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
@@ -312,6 +410,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei
 .attn-warn{background:#ffeaa7;border:1px solid #fdcb6e;padding:10px 14px;border-radius:6px;
            font-size:.84em;margin:10px 0;display:none}
 .attn-warn.show{display:block}
+.pool-info{background:#e8f4fd;border-radius:6px;padding:8px 14px;font-size:.78em;color:#0984e3;text-align:center;margin:4px 0}
 </style>
 </head>
 <body>
@@ -321,13 +420,15 @@ let D={};
 let S={phase:'briefing',pid:'P01',age:'',cq:'',page:0,
        anchors:[],train:[],main:[],refs:{},attnGrid:null,attnPos:10,
        attnGrid2:null,attnPos2:13,instrGrid:null,instrHazard:'GEO',
-       currentIdx:0,currentList:[],ratings:[],qStart:0,trainResults:[]};
+       currentIdx:0,currentList:[],ratings:[],qStart:0,trainResults:[],
+       totalPool:400,remaining:400};
 
 fetch('/api/data').then(r=>r.json()).then(d=>{
-    Object.assign(S,{anchors:d.anchors,train:d.training,main:shuffle(d.main),
+    Object.assign(S,{anchors:d.anchor,train:d.training,main:shuffle(d.main),
                      refs:d.refs,attnGrid:d.attention_check,attnPos:d.attention_position,
                      attnGrid2:d.attention_check_2,attnPos2:d.attention_position_2,
-                     instrGrid:d.instr_check_grid,instrHazard:d.instr_check_hazard});
+                     instrGrid:d.instr_check_grid,instrHazard:d.instr_check_hazard,
+                     totalPool:d.total_pool,remaining:d.remaining_under_5});
 });
 
 function shuffle(a){for(let i=a.length-1;i>0;i--){let j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}return a}
@@ -338,50 +439,32 @@ function R(){document.getElementById('app').innerHTML={
 
 function Bf(){
 let p=S.page;
-if(p===0)return `<div class="top"><h1>灾害风险感知评分任务</h1><div class="sub">重庆市街景图像 · 预测试</div></div>
+if(p===0)return `<div class="top"><h1>灾害风险感知评分任务</h1><div class="sub">重庆市街景图像 · 正式实验 v4</div></div>
 <div class="card briefing">
 <h2>任务概述</h2>
-<p>您将看到<strong>30组</strong>重庆市不同位置的街景图像（每组4张，拍摄了该位置前、右、后、左四个方向）。</p>
-<p>对每组图像，您需要回答<strong>三个问题</strong>——只看图像中能看到的东西，判断该位置在三种灾害情境下的风险程度。</p>
-<p style="color:#888;font-size:.8em">这不是对错测试——不同人的判断可能不同，我们研究的就是这种差异。预计 25-30 分钟。</p>
-<h2>三个灾害类型</h2>
-<div class="disaster-card"><h4>FLD · 洪涝积水</h4>
-<p><strong>问题：</strong>如果发生暴雨，这个地方积水的可能性有多大？</p>
-<p><strong>高分：</strong>大面积硬质路面、建筑紧逼峡谷感、道路低洼、无绿化</p>
-<p><strong>低分：</strong>透水地面、空间开阔、位于坡顶、排水设施可见</p></div>
-<div class="disaster-card"><h4>GEO · 边坡滑坡</h4>
-<p><strong>问题：</strong>从街景来看，这个地方发生滑坡/崩塌的可能性有多大？</p>
-<p><strong>高分：</strong>裸岩/土坡直接可见、挡土墙密集、道路紧贴陡坡脚</p>
-<p><strong>低分：</strong>完全平坦、视野内无任何坡面</p></div>
-<div class="disaster-card"><h4>FIR · 火灾疏散</h4>
-<p><strong>问题：</strong>如果附近建筑发生火灾，疏散和消防车到达有多困难？</p>
-<p><strong>高分：</strong>建筑密集无间距、巷道狭窄、占道停车</p>
-<p><strong>低分：</strong>建筑稀疏、道路宽阔、附近有开阔场地</p></div>
+<p>您将看到<strong>20组</strong>重庆市不同位置的街景图像（每组4张，前/右/后/左四个方向）。</p>
+<p>每组图像，您需要回答<strong>三个问题</strong>——只看图像中可以看到的东西，判断该位置在三种灾害情境下的风险程度。</p>
+<p style="color:#888;font-size:.8em">这不是对错测试——不同人的判断可能不同，我们研究的就是这种差异。预计 20-25 分钟。</p>
+${disasterCards()}
 <h2>流程</h2>
-<p><strong>第1步：</strong>浏览8张锚定示例图 → 了解1-7分"长什么样"</p>
-<p><strong>第2步：</strong>练习评分6张 → 独立评分后查看对比</p>
-<p><strong>第3步：</strong>正式评分16张 → 独立判断</p>
+<p><strong>第1步：</strong>浏览1张锚定示例图 → 了解1-7分"长什么样"</p>
+<p><strong>第2步：</strong>练习评分4张 → 独立评分后查看对比</p>
+<p><strong>第3步：</strong>正式评分15张 → 独立判断</p>
 <p><strong>第4步：</strong>填写简短反馈 → 完成</p>
-<div class="warn-box"><strong>⚠ 请使用1-7的整个范围</strong>，不要全部集中在3-5分。速度不重要，一致性更重要。</div>
+<div class="warn-box"><strong>⚠ 请使用1-7的整个范围</strong>。如果图像确实极端，就打1或7。不要全部集中在3-5分。</div>
 </div>
+<div class="pool-info">📊 总格网池: ${S.totalPool} | 待完成: ${S.remaining} | 您的15组正式评分将从待评格网中随机分配</div>
 <div class="btns"><button class="btn btn-p" onclick="S.page=1;R()">下一页：评分指南 →</button></div>`;
 
-return `<div class="top"><h1>灾害风险感知评分任务</h1><div class="sub">评分线索指南</div></div>
+return `<div class="top"><h1>评分线索指南</h1></div>
 <div class="card briefing">
 <h2>怎么看图评分？</h2>
-<p>评分时<strong>只看图像中可见的物理场景</strong>——路面、建筑、山体、植被、道路宽度、天空可见度等。</p>
-<h3>应该看的线索</h3>
-<table style="width:100%;font-size:.83em;border-collapse:collapse;margin:8px 0">
-<tr style="background:#f0f2f5"><th>灾种</th><th>高风险（→7分）</th><th>低风险（→1分）</th></tr>
-<tr><td><strong>FLD 洪涝</strong></td><td>大面积硬质路面、建筑紧逼天空少、道路低洼、无绿化</td><td>透水地面、空间开阔、坡顶、排水可见</td></tr>
-<tr><td><strong>GEO 边坡</strong></td><td>裸岩/土坡可见、挡土墙密集、路贴陡坡</td><td>完全平坦、无坡面</td></tr>
-<tr><td><strong>FIR 火灾</strong></td><td>建筑密集无间距、巷道窄、占道停车</td><td>建筑稀疏、道路宽、有开阔场地</td></tr>
-</table>
+<p>评分时<strong>只看图像中可见的物理场景</strong>——路面、建筑、山体、植被、道路宽度等。</p>
+${cueTable()}
 <h3>不能用的线索</h3>
 <div class="warn-box">
 ✗ 天气好坏——假设暴雨/火灾已发生<br>
 ✗ 社区是否"高档"——与灾害风险无关<br>
-✗ 绿化是否"漂亮"——绿化可能掩盖风险<br>
 ✗ 地下排水/室内消防——你看不到它们<br>
 ✗ "总体安全感"——我们问的是具体灾害
 </div>
@@ -398,28 +481,56 @@ return `<div class="top"><h1>灾害风险感知评分任务</h1><div class="sub"
 </div>`;
 }
 
+function disasterCards(){
+return `<div class="disaster-card"><h4>FLD · 洪涝积水</h4>
+<p><strong>问题：</strong>如果发生暴雨，这个地方积水的可能性有多大？</p>
+<p><strong>高分：</strong>大面积硬质路面、建筑紧逼峡谷感、道路低洼、无绿化</p>
+<p><strong>低分：</strong>透水地面、空间开阔、位于坡顶、排水设施可见</p></div>
+<div class="disaster-card"><h4>GEO · 边坡滑坡</h4>
+<p><strong>问题：</strong>从街景来看，这个地方发生滑坡/崩塌的可能性有多大？</p>
+<p><strong>高分：</strong>裸岩/土坡直接可见、挡土墙密集、道路紧贴陡坡脚</p>
+<p><strong>低分：</strong>完全平坦、视野内无任何坡面 → 直接打1分</p></div>
+<div class="disaster-card"><h4>FIR · 火灾疏散</h4>
+<p><strong>问题：</strong>如果附近建筑发生火灾，疏散和消防车到达有多困难？</p>
+<p><strong>高分：</strong>建筑密集无间距、巷道狭窄、占道停车</p>
+<p><strong>低分：</strong>建筑稀疏、道路宽阔、附近有开阔场地</p></div>`;
+}
+
+function cueTable(){
+return `<table style="width:100%;font-size:.83em;border-collapse:collapse;margin:8px 0">
+<tr style="background:#f0f2f5"><th>灾种</th><th>看什么</th><th>高风险（→7分）</th><th>低风险（→1分）</th></tr>
+<tr><td><strong>FLD 洪涝</strong></td><td><b>地面渗透性</b></td><td>硬质路面全覆盖、峡谷感、低洼、无绿化</td><td>透水地面、开阔、坡顶、排水可见</td></tr>
+<tr><td><strong>GEO 边坡</strong></td><td><b>有无坡面</b></td><td>裸岩/土坡可见、挡土墙密集、路贴陡坡</td><td>完全平坦、无坡面 → <b>直接1分</b></td></tr>
+<tr><td><strong>FIR 火灾</strong></td><td><b>道路通行性</b></td><td>建筑密集无间距、巷道窄、占道停车</td><td>建筑稀疏、道路宽、有开阔场地</td></tr>
+</table>
+<div style="margin-top:10px;padding:10px;background:#fff3cd;border-radius:6px;font-size:.78em">
+<strong>⚠️ FLD vs FIR 怎么区分？</strong><br>
+• FLD 看<b>地面</b>（能不能透水）→ 硬化路面积水，泥土地不积水<br>
+• FIR 看<b>道路</b>（能不能跑出去）→ 窄巷子难疏散，宽阔道路容易疏散<br>
+• 同一地方可以 FLD=高 FIR=低（宽阔硬化广场），也可以 FLD=低 FIR=高（窄巷透水砖路）
+</div>`;
+}
+
 function Ba(){
-let g=S.currentList[S.currentIdx],ref=S.refs[g]||{},pct=Math.round((S.currentIdx+1)/S.currentList.length*100);
+let g=S.currentList[S.currentIdx],ref=S.refs[g]||{};
 return `<div class="top"><h1>第1步：锚定浏览</h1><div class="sub">了解评分标准 · 不须作答</div></div>
 <div class="steps"><span class="on">锚定</span><span>练习</span><span>正式评分</span></div>
-<div class="bar-wrap"><div class="bar-fill" style="width:${pct}%"></div></div>
-<div style="text-align:center;color:#888;font-size:.8em;margin:6px 0">${S.currentIdx+1}/${S.currentList.length}</div>
+<div style="text-align:center;color:#888;font-size:.8em;margin:6px 0">唯一锚定示例</div>
 ${imgGrid(g)}
 <div class="card ref-box"><strong>AI 参考分（帮您建立1-7的参照）：</strong><br>
 FLD 积水可能性 = <strong>${ref.FLD}/7</strong> &nbsp;|&nbsp;
 GEO 滑坡可能性 = <strong>${ref.GEO}/7</strong> &nbsp;|&nbsp;
 FIR 疏散难度 = <strong>${ref.FIR}/7</strong>
-<div style="font-size:.75em;color:#888;margin-top:4px">参考分由AI根据图像特征估算，仅供建立参照系。请点击下方「评分线索速查」理解每个分数的含义。</div></div>
+<div style="font-size:.75em;color:#888;margin-top:4px">请对照下方线索速查表理解每个分数的含义</div></div>
 ${cueToggle()}
-<div class="btns"><button class="btn ${S.currentIdx<S.currentList.length-1?'btn-p':'btn-g'}" onclick="nextAnchor()">${S.currentIdx<S.currentList.length-1?'下一张 →':'进入练习 →'}</button></div>`;
+<div class="btns"><button class="btn btn-g" onclick="nextAnchor()">进入练习 →</button></div>`;
 }
 
 function Bp(){
 let g=S.currentList[S.currentIdx],prev=S.trainResults[S.currentIdx],pct=Math.round((S.currentIdx+1)/S.currentList.length*100);
-return `<div class="top"><h1>第2步：练习校准</h1><div class="sub">独立评分后查看对比</div></div>
+return `<div class="top"><h1>第2步：练习校准</h1><div class="sub">独立评分后查看对比 · ${S.currentIdx+1}/${S.currentList.length}</div></div>
 <div class="steps"><span>锚定</span><span class="on">练习</span><span>正式评分</span></div>
 <div class="bar-wrap"><div class="bar-fill" style="width:${pct}%"></div></div>
-<div style="text-align:center;color:#888;font-size:.8em;margin:6px 0">${S.currentIdx+1}/${S.currentList.length}</div>
 ${prev?feedbackBox(prev):''}
 ${imgGrid(g)}
 ${cueToggle()}
@@ -433,12 +544,11 @@ function Bm(){
 let g=S.currentList[S.currentIdx],pct=Math.round((S.currentIdx+1)/S.currentList.length*100);
 let acWarn='';
 if(S.currentIdx===S.attnPos-1&&S.attnGrid)acWarn+='<div class="attn-warn show">注意：接下来的场景您之前已经见过。请根据当前判断评分。</div>';
-if(S.currentIdx===S.attnPos2-1&&S.attnGrid2)acWarn+='<div class="attn-warn show">注意：接下来的场景您在本轮中已经评过。请根据当前判断评分，不要刻意保持一致。</div>';
+if(S.currentIdx===S.attnPos2-1&&S.attnGrid2)acWarn+='<div class="attn-warn show">注意：接下来的场景您在本轮中已经评过。</div>';
 if(S.instrPos!==undefined&&S.currentIdx===S.instrPos)acWarn+='<div class="attn-warn show" style="background:#dfe6e9">📋 本轮为指令检验，请仔细阅读问题文字。</div>';
-return `<div class="top"><h1>第3步：正式评分</h1><div class="sub">独立判断 · 无反馈</div></div>
+return `<div class="top"><h1>第3步：正式评分</h1><div class="sub">独立判断 · 无反馈 · ${S.currentIdx+1}/${S.currentList.length}</div></div>
 <div class="steps"><span>锚定</span><span>练习</span><span class="on">正式评分</span></div>
 <div class="bar-wrap"><div class="bar-fill" style="width:${pct}%"></div></div>
-<div style="text-align:center;color:#888;font-size:.8em;margin:6px 0">${S.currentIdx+1}/${S.currentList.length}</div>
 ${acWarn}
 ${imgGrid(g)}
 ${cueToggle()}
@@ -454,18 +564,18 @@ return `<div class="top"><h1>反馈问卷</h1></div>
 <label>1. 三个问题分别在问什么？</label><textarea id="f1" rows="2"></textarea>
 <label>2. 哪个最有把握？哪个最没把握？</label><textarea id="f2" rows="2"></textarea>
 <label>3. 评分时主要看图像的哪些特征？</label><textarea id="f3" rows="2"></textarea>
-<label>4. 有没有"看着舒服"但给了高风险，或"看着不好看"但给了低风险的情况？</label><textarea id="f4" rows="2"></textarea>
+<label>4. 有没有"看着舒服"但给了高风险，或反之？</label><textarea id="f4" rows="2"></textarea>
 <label>5. 洪水风险和火灾疏散难度——如何区分？</label><textarea id="f5" rows="2"></textarea>
 <label>6. 1-7分范围够用吗？</label><textarea id="f6" rows="1"></textarea>
 <label>7. 评分标准前后有变化吗？</label><textarea id="f7" rows="1"></textarea>
 <label>8. 有什么困惑？</label><textarea id="f8" rows="2"></textarea>
 <label>9. 有什么建议？</label><textarea id="f9" rows="2"></textarea>
-<div class="btns"><button class="btn btn-g" onclick="subFeedback()">提交并导出数据</button></div>
+<div class="btns"><button class="btn btn-g" onclick="subFeedback()">提交并完成</button></div>
 </div>`;
 }
 
 function Bc(){
-return `<div class="done card"><h2>预测试完成！</h2><p>感谢参与！数据已保存。</p><p style="color:#888;margin-top:8px;font-size:.85em">您可以关闭此页面了。</p></div>`;
+return `<div class="done card"><h2>实验完成！</h2><p>感谢参与！数据已保存。</p><p style="color:#888;margin-top:8px;font-size:.85em">您可以关闭此页面了。</p></div>`;
 }
 
 function imgGrid(gid){
@@ -475,21 +585,7 @@ return '<div class="imgs">'+dirs.map((d,i)=>`<div><img src="/img/${gid}/${d}" al
 
 function cueToggle(){
 return `<div class="cue-toggle"><button onclick="document.getElementById('cuecard').classList.toggle('show')">📋 评分线索速查（点击展开/收起）</button></div>
-<div class="cue-card" id="cuecard">
-<table>
-<tr><th>灾种</th><th>高风险（→7分）</th><th>低风险（→1分）</th></tr>
-<tr><td><strong>FLD 洪涝</strong></td><td>硬质路面全覆盖、峡谷感（SVF低）、低洼、无绿化</td><td>透水地面、开阔、坡顶、排水可见</td></tr>
-<tr><td><strong>GEO 边坡</strong></td><td>裸岩/土坡可见、挡土墙密集、路贴陡坡</td><td>完全平坦、无坡面 → <b>直接1分</b></td></tr>
-<tr><td><strong>FIR 火灾</strong></td><td>建筑密集无间距、巷道窄、占道停车</td><td>建筑稀疏、道路宽、有开阔场地</td></tr>
-</table>
-<div style="margin-top:10px;padding:10px;background:#fff3cd;border-radius:6px;font-size:.75em">
-<strong>⚠️ FLD vs FIR 怎么区分？</strong><br>
-• FLD 看<b>地面</b>（能不能透水）→ 硬化路面积水，泥土地不积水<br>
-• FIR 看<b>道路</b>（能不能跑出去）→ 窄巷子难疏散，宽阔道路容易疏散<br>
-• 同一个地方可以 FLD=高 FIR=低（宽阔硬化广场），也可以 FLD=低 FIR=高（窄巷透水砖路）<br>
-• <b>不要因为"这里看着危险"就把三个都打高分</b>
-</div>
-<p style="font-size:.72em;color:#888;margin-top:4px">1=最低 · 4=中等 · 7=最高 &nbsp;|&nbsp; 三个灾种独立判断</p></div>`;
+<div class="cue-card" id="cuecard">${cueTable()}<p style="font-size:.72em;color:#888;margin-top:4px">1=最低 · 4=中等 · 7=最高 &nbsp;|&nbsp; 三个灾种独立判断</p></div>`;
 }
 
 function ratingForm(phase,instrHazard){
@@ -504,7 +600,6 @@ let scales={
        tip:'1=极容易疏散 · 4=中等 · 7=几乎无法疏散',
        lbls:['极容易\\n疏散','很容易\\n疏散','较容易\\n疏散','中等','较困难\\n疏散','很困难\\n疏散','几乎无法\\n疏散']}
 };
-// 指令检验：嵌入"本题请选4"
 if(instrHazard && scales[instrHazard]){
   scales[instrHazard].q='<span style="color:#e17055">【指令检验】本题请选4。</span> '+scales[instrHazard].q;
   scales[instrHazard].tip='请仔细阅读问题文字后作答 · '+scales[instrHazard].tip;
@@ -549,7 +644,6 @@ function fastWarn(){
   if(allFast)return'<div style="background:#ffeaa7;border:1px solid #fdcb6e;padding:8px 14px;border-radius:6px;font-size:.8em;margin:8px 0">⚠️ 最近3题作答都很快（<8秒），请仔细观看每张图片后再评分。</div>';
   return'';
 }
-
 function feedbackBox(r){
 let oks=[Math.abs(r.FLD-r.rFLD)<=1,Math.abs(r.GEO-r.rGEO)<=1,Math.abs(r.FIR-r.rFIR)<=1];
 let n=oks.filter(x=>x).length,cls=n>=3?'good':(n>=2?'warn':'bad');
@@ -569,7 +663,7 @@ let _demoSent=false;
 function saveOne(phase,grid_id,r,is_ac){
   let payload={participant_id:S.pid,phase,grid_id,FLD:r.FLD,GEO:r.GEO,FIR:r.FIR,
                response_time_sec:Math.round((Date.now()-S.qStart)/100)/10,
-               is_ac:is_ac?'1':''};
+               is_ac:is_ac?'1':'',is_ac2:'',is_instr:'',instr_hazard:'',instr_passed:null};
   if(!_demoSent){payload.demographics={age:S.age,chongqing_years:S.cq};_demoSent=true}
   fetch('/save-one',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),keepalive:true}).catch(()=>{});
 }
@@ -594,11 +688,8 @@ let isAC1=(g===S.attnGrid&&S.currentIdx===S.attnPos);
 let isAC2=(g===S.attnGrid2&&S.currentIdx===S.attnPos2);
 let isInstr=(S.instrPos!==undefined&&S.currentIdx===S.instrPos);
 let isAC=isAC1||isAC2||isInstr;
-// 指令检验：记录是否遵从了"选4"指令
 let instrPassed=null;
-if(isInstr&&S.instrHazard){
-  instrPassed=r[S.instrHazard]===4;
-}
+if(isInstr&&S.instrHazard){instrPassed=r[S.instrHazard]===4;}
 S.ratings.push({phase:'main',grid_id:g,...r,response_time_sec:rt,
   is_ac:isAC?'1':'',is_ac2:isAC2?'1':'',is_instr:isInstr?'1':'',
   instr_hazard:isInstr?S.instrHazard:'',instr_passed:instrPassed});
@@ -608,18 +699,13 @@ R();S.qStart=Date.now();
 }
 async function subFeedback(){
 let fb={};for(let i=1;i<=9;i++)fb['Q'+i]=document.getElementById('f'+i)?.value||'';
-// 注意力检验 C1: 练习 R117C010 vs 正式 R117C010
 let pracR=S.trainResults[1],mainR=S.ratings.filter(r=>r.grid_id===S.attnGrid&&r.phase==='main')[0];
 let ac1Passed=null;
 if(pracR&&mainR)ac1Passed=[Math.abs(pracR.FLD-mainR.FLD),Math.abs(pracR.GEO-mainR.GEO),Math.abs(pracR.FIR-mainR.FIR)].every(d=>d<=2);
-// 注意力检验 C2: 正式阶段内部重复
 let ac2Rows=S.ratings.filter(r=>r.is_ac2==='1');
 let ac2Passed=null;
-if(ac2Rows.length===2){
-  let a=ac2Rows[0],b=ac2Rows[1];
-  ac2Passed=[Math.abs(a.FLD-b.FLD),Math.abs(a.GEO-b.GEO),Math.abs(a.FIR-b.FIR)].every(d=>d<=2);
-}
-// 指令检验 C3: "本题请选4"
+if(ac2Rows.length===2){let a=ac2Rows[0],b=ac2Rows[1];
+  ac2Passed=[Math.abs(a.FLD-b.FLD),Math.abs(a.GEO-b.GEO),Math.abs(a.FIR-b.FIR)].every(d=>d<=2);}
 let instrRow=S.ratings.filter(r=>r.is_instr==='1')[0];
 let instrPassed=instrRow?instrRow.instr_passed:null;
 let payload={participant_id:S.pid,demographics:{age:S.age,chongqing_years:S.cq},feedback:fb,
@@ -641,7 +727,7 @@ ADMIN_HTML = r'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>数据管理 — 预测试</title>
+<title>数据管理 — 感知评分实验</title>
 <style>
 body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;max-width:700px;margin:40px auto;padding:20px;background:#f5f5f5}
 h1{color:#2c3e50}
@@ -654,8 +740,9 @@ a:hover{text-decoration:underline}
 </style>
 </head>
 <body>
-<h1>预测试数据管理</h1>
-<p style="color:#888">参与者提交评分后，数据文件会出现在下方。点击 Download 下载 CSV。</p>
+<h1>感知评分数据管理</h1>
+{{PROGRESS}}
+<p style="color:#888">参与者提交评分后，数据文件会出现在下方。点击 Download 下载 CSV（含经纬度和图片编号）。</p>
 <a class="refresh" href="/admin">刷新</a>
 <table><tr><th>文件名</th><th>数据量</th><th>操作</th></tr>{{ROWS}}</table>
 <p style="color:#888;margin-top:20px;font-size:.8em">注意：Render 免费版重新部署后数据会丢失。请及时下载保存。</p>
@@ -663,10 +750,23 @@ a:hover{text-decoration:underline}
 </html>'''
 
 def main():
+    # Ensure data files are in DATA_DIR
+    for fname in ['perception_rating_sample_v1.csv', 'perception_rating_image_list_v1.csv']:
+        src = Path('clean') / fname
+        dst = DATA_DIR / fname
+        if src.exists() and not dst.exists():
+            import shutil
+            shutil.copy2(str(src), str(dst))
+
     port = int(os.environ.get('PORT', 8724))
     server = HTTPServer(('0.0.0.0', port), Handler)
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     print(f"Server running on port {port}")
+    print(f"Grid pool: {len(ALL_GRIDS_POOL)} | Anchor: {ANCHOR_GRID} | Practice: {len(PRACTICE_GRIDS)}")
+    counts = load_counts()
+    rated = sum(1 for c in counts.values() if c > 0)
+    done = sum(1 for c in counts.values() if c >= 5)
+    print(f"Progress: {rated}/400 rated | {done}/400 complete (≥5)")
     server.serve_forever()
 
 if __name__ == '__main__':
